@@ -141,6 +141,7 @@ static void updateDisplayData(display_data_t *data) {
         data->networkHashrate[sizeof(data->networkHashrate) - 1] = '\0';
         strncpy(data->networkDifficulty, lstats.networkDifficulty, sizeof(data->networkDifficulty) - 1);
         data->networkDifficulty[sizeof(data->networkDifficulty) - 1] = '\0';
+        data->networkDifficultyRaw = lstats.difficultyRaw;
         
         data->difficultyProgress = lstats.difficultyProgress;
         data->difficultyChange = lstats.difficultyChange;
@@ -281,6 +282,11 @@ void monitor_task(void *param) {
                 extern volatile uint64_t s_core0Hashes;
                 extern volatile uint64_t s_core1Hashes;
                 Serial.printf("[STATS] Core0: %llu hashes, Core1: %llu hashes\n", s_core0Hashes, s_core1Hashes);
+#ifdef MINER_VALIDATE
+                extern volatile uint32_t s_core1Candidates;
+                extern volatile uint32_t s_core1Verified;
+                Serial.printf("[STATS] Core1 candidates: %lu, verified: %lu\n", s_core1Candidates, s_core1Verified);
+#endif
 
                 // Heap monitoring - track memory usage over time
                 uint32_t freeHeap = ESP.getFreeHeap();

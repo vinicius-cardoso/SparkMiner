@@ -60,6 +60,7 @@ struct display_data_s {
     uint32_t blockHeight;
     char networkHashrate[24];
     char networkDifficulty[24];
+    double networkDifficultyRaw;
     int halfHourFee;
     
     // Difficulty Adjustment

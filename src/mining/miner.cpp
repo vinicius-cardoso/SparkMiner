@@ -71,6 +71,12 @@ static mining_stats_t s_stats = {0};
 volatile uint64_t s_core0Hashes = 0;
 volatile uint64_t s_core1Hashes = 0;
 
+#ifdef MINER_VALIDATE
+// DEBUG: hardware candidates vs. software-verified ones (should match 1:1)
+volatile uint32_t s_core1Candidates = 0;
+volatile uint32_t s_core1Verified = 0;
+#endif
+
 // Nonce ranges for dual-core
 static unsigned long s_startNonce[2] = {0, 0x80000000};
 
@@ -704,7 +710,13 @@ void miner_task_core1(void *param) {
                 // BitsyMiner CRITICAL pattern: Verify with SOFTWARE SHA on UNSWAPPED header
                 // This is what the pool computes, so hashes MUST match!
                 hbVerify.nonce = candidate_nonce_native;
+#ifdef MINER_VALIDATE
+                s_core1Candidates++;
+#endif
                 if (miner_sha256_header(&midstate, &ctx, &hbVerify)) {
+#ifdef MINER_VALIDATE
+                    s_core1Verified++;
+#endif
                     // SOFTWARE verified share - submit it
                     hashCheck(jobId, &ctx, hbVerify.timestamp, candidate_nonce_native);
                 }
