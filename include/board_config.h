@@ -432,6 +432,38 @@
     // SHA Implementation: classic ESP32 pipelined Xtensa ASM auto-selected via
     // CONFIG_IDF_TARGET_ESP32 (USE_HARDWARE_SHA in platformio.ini is cosmetic here)
 
+// ============================================================
+// Tenstar T-Display (LILYGO T-Display V1 clone), 135x240 ST7789 SPI
+// Shows the retro SSD1306 UI: a 120x64 1-bit canvas blitted to the TFT at 2x
+// ============================================================
+#elif defined(TENSTAR_T_DISPLAY)
+    #define BOARD_NAME "Tenstar-T-Display"
+
+    #define USE_DISPLAY 0
+    #define USE_OLED_DISPLAY 1
+    #ifndef OLED_ON_TFT
+        #define OLED_ON_TFT 1
+    #endif
+    #ifndef OLED_WIDTH
+        #define OLED_WIDTH 120
+    #endif
+    #ifndef OLED_HEIGHT
+        #define OLED_HEIGHT 64
+    #endif
+
+    // Backlight (PWM)
+    #ifndef TFT_BL_PIN
+        #define TFT_BL_PIN 4
+    #endif
+
+    // Buttons: GPIO0 = BOOT, GPIO35 = input-only, external pull-up on the board
+    #ifndef BUTTON_PIN
+        #define BUTTON_PIN 0
+    #endif
+    #ifndef BUTTON2_PIN
+        #define BUTTON2_PIN 35
+    #endif
+    #define BUTTON_ACTIVE_LOW 1
 
 // ============================================================
 // Default - Generic ESP32

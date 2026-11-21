@@ -91,6 +91,27 @@ uint16_t oled_display_get_height();
 bool oled_display_is_portrait();
 
 /**
+ * Previous screen (second button)
+ */
+void oled_display_prev_screen();
+
+/**
+ * Rotation 0 or 2 (180 degree flip)
+ */
+void oled_display_set_rotation(uint8_t rotation);
+
+/**
+ * Show a level (0-100) in a toast over the current screen, e.g. brightness
+ */
+void oled_display_show_level(const char *title, uint8_t percent);
+
+/**
+ * Toggle automatic screen cycling (saved in NVS)
+ * @return true if now on
+ */
+bool oled_display_toggle_auto_cycle();
+
+/**
  * Screen management
  */
 uint8_t oled_display_get_screen();

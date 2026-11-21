@@ -7,6 +7,10 @@
  * A B X Y buttons (A/B convex = filled, X/Y concave = hollow), keycaps with
  * a thick bottom edge, and progress drawn as blocks instead of a smooth bar.
  *
+ * With OLED_ON_TFT (T-Display) the same screens are drawn into a 1-bit
+ * OLED_WIDTH x OLED_HEIGHT canvas that is pushed to the ST7789 at 2x, so the
+ * pixels, fonts and colors are those of the SSD1306.
+ *
  * GPL v3 License
  */
 
@@ -17,8 +21,16 @@
 #if USE_OLED_DISPLAY
 
 #include <U8g2lib.h>
-#include <Wire.h>
 #include <math.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <Preferences.h>
+
+#if OLED_ON_TFT
+    #include <TFT_eSPI.h>
+#else
+    #include <Wire.h>
+#endif
 
 // ============================================================
 // Configuration
@@ -62,12 +74,74 @@
 #define TITLE_W     8       // FONT_TITLE advance
 #define HEADER_H    13      // strip (10) + gap (1) + rule (2)
 
+// Screens advance on their own every AUTO_CYCLE_MS when auto cycle is on
+#define AUTO_CYCLE_MS   8000
+#define TOAST_MS        1800
+
 // ============================================================
 // U8g2 Display Object
 // ============================================================
 
+#if OLED_ON_TFT
+
+// Scale and panel size (landscape)
+#define TFT_SCALE   2
+#define PANEL_W     240
+#define PANEL_H     135
+#define CANVAS_X    ((PANEL_W - OLED_WIDTH * TFT_SCALE) / 2)
+#define CANVAS_Y    ((PANEL_H - OLED_HEIGHT * TFT_SCALE) / 2)
+
+// The SSD1306 colors: lit pixels white, dark pixels black
+#ifndef MONO_LIT
+    #define MONO_LIT    0xFFFF
+#endif
+#ifndef MONO_DARK
+    #define MONO_DARK   0x0000
+#endif
+
+// Backlight PWM (LEDC channel 7 stays clear of anything else in this build)
+#define BL_LEDC_CH      7
+#define BL_LEDC_FREQ    5000
+#define BL_LEDC_BITS    8
+
+// U8g2 with no hardware behind it: a full W x H buffer in the SSD1306 layout
+// (bytes are 8-pixel columns, LSB on top)
+template <int W, int H>
+class U8G2_CANVAS : public U8G2 {
+public:
+    U8G2_CANVAS() : U8G2() {
+        u8g2_SetupDisplay(&u8g2, setupCb, u8x8_cad_empty, u8x8_byte_empty, u8x8_dummy_cb);
+        u8g2_SetupBuffer(&u8g2, s_buf, (H + 7) / 8, u8g2_ll_hvline_vertical_top_lsb, U8G2_R0);
+    }
+
+private:
+    static uint8_t s_buf[W * ((H + 7) / 8)];
+
+    static uint8_t setupCb(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr) {
+        if (msg == U8X8_MSG_DISPLAY_SETUP_MEMORY) {
+            static u8x8_display_info_t info;
+            memset(&info, 0, sizeof(info));
+            info.tile_width = (W + 7) / 8;
+            info.tile_height = (H + 7) / 8;
+            info.pixel_width = W;
+            info.pixel_height = H;
+            u8x8_d_helper_display_setup_memory(u8x8, &info);
+        }
+        return 1;
+    }
+};
+
+template <int W, int H>
+uint8_t U8G2_CANVAS<W, H>::s_buf[W * ((H + 7) / 8)];
+
+static U8G2_CANVAS<OLED_WIDTH, OLED_HEIGHT> s_u8g2;
+// One-page (128x8) canvas for rendering glyphs before scaling them up
+static U8G2_CANVAS<128, 8> s_glyphs;
+static TFT_eSPI s_tft;
+static uint16_t s_line[OLED_WIDTH * TFT_SCALE];
+
 // Select display constructor based on size
-#if (OLED_HEIGHT == 64)
+#elif (OLED_HEIGHT == 64)
     // 128x64 SSD1306
     static U8G2_SSD1306_128X64_NONAME_F_HW_I2C s_u8g2(U8G2_R0, U8X8_PIN_NONE);
 #elif (OLED_HEIGHT == 32)
@@ -78,9 +152,11 @@
     static U8G2_SSD1306_128X64_NONAME_F_HW_I2C s_u8g2(U8G2_R0, U8X8_PIN_NONE);
 #endif
 
+#if !OLED_ON_TFT
 // One-page (128x8) canvas for rendering glyphs before scaling them up.
 // Never begun, so it never touches the bus.
 static U8G2_SSD1306_128X64_NONAME_1_HW_I2C s_glyphs(U8G2_R0, U8X8_PIN_NONE);
+#endif
 
 // ============================================================
 // State
@@ -90,9 +166,30 @@ static uint8_t s_currentScreen = OLED_SCREEN_MAIN;
 static uint8_t s_brightness = 255;
 static uint8_t s_rotation = 0;
 static bool s_needsRedraw = true;
-static bool s_inverted = false;
+static bool s_inverted = true;     // dark theme until set_inverted()
 static bool s_screenOff = false;
 static bool s_blink = false;        // toggles every update, drives attention lamps
+
+// Rendering happens on the monitor task and, for instant feedback, on the
+// button task: the lock keeps them from drawing into the buffer at once
+static SemaphoreHandle_t s_lock = NULL;
+static display_data_t s_last;       // latest data, to redraw right after a button press
+static bool s_hasData = false;
+static bool s_modal = false;        // reset screens own the display until redraw()
+
+static bool s_autoCycle = false;
+static uint32_t s_lastCycle = 0;
+
+// Toast: a small box over the current screen (brightness, auto cycle...)
+static char s_toastTitle[12];
+static char s_toastText[16];
+static float s_toastLevel = -1;     // >= 0 draws a block bar instead of text
+static uint32_t s_toastUntil = 0;
+
+struct DisplayLock {
+    DisplayLock()  { if (s_lock) xSemaphoreTakeRecursive(s_lock, portMAX_DELAY); }
+    ~DisplayLock() { if (s_lock) xSemaphoreGiveRecursive(s_lock); }
+};
 
 // ============================================================
 // Formatting Helpers (fixed buffers, no String)
@@ -160,8 +257,52 @@ static void fitChars(char *s, int maxChars) {
 // Drawing Primitives
 // ============================================================
 
+#if OLED_ON_TFT
+// invertColors=true is the dark theme: lit pixels on black, like the OLED
+static uint16_t colorLit()  { return s_inverted ? MONO_LIT : MONO_DARK; }
+static uint16_t colorDark() { return s_inverted ? MONO_DARK : MONO_LIT; }
+
+// Each canvas pixel becomes a TFT_SCALE x TFT_SCALE block
+static void blitCanvas() {
+    const uint8_t *buf = s_u8g2.getBufferPtr();
+    const uint16_t lit = colorLit(), dark = colorDark();
+    s_tft.startWrite();
+    s_tft.setAddrWindow(CANVAS_X, CANVAS_Y, OLED_WIDTH * TFT_SCALE, OLED_HEIGHT * TFT_SCALE);
+    for (int y = 0; y < OLED_HEIGHT; y++) {
+        const uint8_t *col = buf + (y >> 3) * OLED_WIDTH;
+        const uint8_t bit = 1 << (y & 7);
+        uint16_t *out = s_line;
+        for (int x = 0; x < OLED_WIDTH; x++) {
+            uint16_t c = (col[x] & bit) ? lit : dark;
+            for (int s = 0; s < TFT_SCALE; s++) *out++ = c;
+        }
+        for (int s = 0; s < TFT_SCALE; s++) s_tft.pushPixels(s_line, OLED_WIDTH * TFT_SCALE);
+    }
+    s_tft.endWrite();
+}
+
+static void setBacklight(uint8_t pct) {
+    ledcWrite(BL_LEDC_CH, (uint32_t)pct * ((1 << BL_LEDC_BITS) - 1) / 100);
+}
+
+static void panelRotation(uint8_t rotation) {
+    // Landscape both ways: 0 -> TFT rotation 3, 2 -> TFT rotation 1
+    s_tft.setRotation(rotation == 2 ? 1 : 3);
+    s_tft.fillScreen(colorDark());
+    blitCanvas();
+}
+#else
+static void panelRotation(uint8_t rotation) {
+    s_u8g2.setDisplayRotation(rotation == 2 ? U8G2_R2 : U8G2_R0);
+}
+#endif
+
 static void present() {
+#if OLED_ON_TFT
+    blitCanvas();
+#else
     s_u8g2.sendBuffer();
+#endif
 #ifdef OLED_SCREENSHOT
     // Debug: dump the frame so it can be rendered on the host
     const uint8_t *buf = s_u8g2.getBufferPtr();
@@ -336,9 +477,10 @@ static void drawMainScreen(const display_data_t *data) {
     drawBig(x, 16, num, 2);
     textAt(x + numW + 3, 24, unit);
 
-    // Labels above the keycaps
-    const int kx[3] = {1, 44, 87};
-    const int kw = 40;
+    // Labels above the keycaps: three keys, 3px apart, 1px margins
+    // (128 wide: 40px keys at 1/44/87; 120 wide: 37px keys at 1/41/81)
+    const int kw = (OLED_WIDTH - 2 - 2 * 3) / 3;
+    const int kx[3] = {1, 1 + kw + 3, 1 + 2 * (kw + 3)};
     const char *labels[3] = {"SHARES", "BEST", "UPTIME"};
     for (int i = 0; i < 3; i++) {
         textAt(kx[i] + (kw - textWidth(labels[i], FONT_TINY)) / 2, 33, labels[i], FONT_TINY);
@@ -467,8 +609,9 @@ static void drawChainScreen(const display_data_t *data) {
     row(45, "FEE", v);
 
     // Difficulty epoch: progress through the 2016 blocks, expected change
+    // Bar leaves 36px on the right for the change ("+12.3%")
     textAt(2, 55, "EPOCH");
-    blockBar(32, 55, 60, 7, 10, data->difficultyProgress / 100.0f);
+    blockBar(32, 55, OLED_WIDTH - 68, 7, 10, data->difficultyProgress / 100.0f);
     if (data->difficultyProgress > 0) {
         snprintf(v, sizeof(v), "%+.1f%%", data->difficultyChange);
         textRight(OLED_WIDTH - 2, 55, v);
@@ -476,46 +619,44 @@ static void drawChainScreen(const display_data_t *data) {
 }
 
 // ============================================================
-// Public API Implementation
+// Toast: boxed message over the current screen
 // ============================================================
 
-void oled_display_init(uint8_t rotation, uint8_t brightness) {
-    Serial.printf("[OLED] Initializing %dx%d display\n", OLED_WIDTH, OLED_HEIGHT);
+static void drawToast() {
+    const int w = OLED_WIDTH - 16, h = 32;
+    const int x = 8, y = 18;
 
-    // Initialize I2C with custom pins
-    Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
+    // Blank the band between the header and the status line, then a double
+    // border like the boot screen
+    s_u8g2.setDrawColor(0);
+    s_u8g2.drawBox(0, HEADER_H + 1, OLED_WIDTH, 40);
+    s_u8g2.setDrawColor(1);
+    s_u8g2.drawFrame(x, y, w, h);
+    s_u8g2.drawFrame(x + 2, y + 2, w - 4, h - 4);
 
-    // Initialize U8g2
-    s_u8g2.begin();
-
-    // Set rotation
-    s_rotation = rotation;
-    if (rotation == 2) {
-        s_u8g2.setDisplayRotation(U8G2_R2);  // 180 degrees
+    textAt(x + (w - textWidth(s_toastTitle, FONT_TITLE)) / 2, y + 7, s_toastTitle, FONT_TITLE);
+    if (s_toastLevel >= 0) {
+        blockBar(x + 8, y + 19, w - 16, 6, 10, s_toastLevel);
     } else {
-        s_u8g2.setDisplayRotation(U8G2_R0);  // Normal
+        textAt(x + (w - textWidth(s_toastText)) / 2, y + 19, s_toastText);
     }
-
-    // Set brightness/contrast
-    s_brightness = (brightness * 255) / 100;
-    s_u8g2.setContrast(s_brightness);
-
-    // Show boot screen
-    oled_display_show_boot();
-
-    Serial.println("[OLED] Display initialized");
 }
 
-void oled_display_update(const display_data_t *data) {
-    if (s_screenOff) return;
+static void showToast(const char *title, const char *text, float level) {
+    strncpy(s_toastTitle, title, sizeof(s_toastTitle) - 1);
+    s_toastTitle[sizeof(s_toastTitle) - 1] = '\0';
+    strncpy(s_toastText, text ? text : "", sizeof(s_toastText) - 1);
+    s_toastText[sizeof(s_toastText) - 1] = '\0';
+    s_toastLevel = level;
+    s_toastUntil = millis() + TOAST_MS;
+}
 
-#ifdef OLED_SCREENSHOT
-    // Debug: walk through every screen so each one gets dumped
-    static uint8_t s_frames = 0;
-    if (++s_frames % 4 == 0) s_currentScreen = (s_currentScreen + 1) % OLED_SCREEN_COUNT;
-#endif
+// ============================================================
+// Rendering
+// ============================================================
 
-    s_blink = !s_blink;
+// Draws the current screen from data and pushes it. Caller holds the lock.
+static void render(const display_data_t *data) {
     s_u8g2.clearBuffer();
     switch (s_currentScreen) {
         case OLED_SCREEN_LOTTO:
@@ -531,22 +672,131 @@ void oled_display_update(const display_data_t *data) {
             drawMainScreen(data);
             break;
     }
+    if (s_toastUntil && (int32_t)(millis() - s_toastUntil) < 0) drawToast();
+    else s_toastUntil = 0;
     present();
     s_needsRedraw = false;
 }
 
-void oled_display_set_brightness(uint8_t brightness) {
+// Redraw now with the latest data (button feedback can't wait for the next
+// one-second update)
+static void renderNow() {
+    DisplayLock lock;
+    if (s_screenOff || s_modal || !s_hasData) return;
+    render(&s_last);
+}
+
+// ============================================================
+// Public API Implementation
+// ============================================================
+
+void oled_display_init(uint8_t rotation, uint8_t brightness) {
+    Serial.printf("[OLED] Initializing %dx%d display\n", OLED_WIDTH, OLED_HEIGHT);
+
+    if (!s_lock) s_lock = xSemaphoreCreateRecursiveMutex();
+    DisplayLock lock;
+
+    // Auto cycle survives reboots (cleared by factory reset with the rest)
+    Preferences prefs;
+    if (prefs.begin("sparkminer", true)) {
+        s_autoCycle = prefs.getBool("autocycle", false);
+        prefs.end();
+    }
+
+    s_rotation = (rotation >= 2) ? 2 : 0;
     s_brightness = (brightness * 255) / 100;
+
+#if OLED_ON_TFT
+    s_tft.init();
+    ledcSetup(BL_LEDC_CH, BL_LEDC_FREQ, BL_LEDC_BITS);
+    ledcAttachPin(TFT_BL_PIN, BL_LEDC_CH);
+    setBacklight(brightness);
+    panelRotation(s_rotation);
+#else
+    // Initialize I2C with custom pins
+    Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
+    s_u8g2.begin();
+    panelRotation(s_rotation);
     s_u8g2.setContrast(s_brightness);
+#endif
+
+    // Show boot screen
+    oled_display_show_boot();
+
+    Serial.println("[OLED] Display initialized");
+}
+
+void oled_display_update(const display_data_t *data) {
+    DisplayLock lock;
+    s_last = *data;
+    s_hasData = true;
+    if (s_screenOff || s_modal) return;
+
+#ifdef OLED_SCREENSHOT
+    // Debug: walk through every screen so each one gets dumped
+    static uint8_t s_frames = 0;
+    if (++s_frames % 4 == 0) s_currentScreen = (s_currentScreen + 1) % OLED_SCREEN_COUNT;
+#endif
+
+    if (s_autoCycle && millis() - s_lastCycle >= AUTO_CYCLE_MS) {
+        s_currentScreen = (s_currentScreen + 1) % OLED_SCREEN_COUNT;
+        s_lastCycle = millis();
+    }
+
+    s_blink = !s_blink;
+    render(data);
+}
+
+void oled_display_set_brightness(uint8_t brightness) {
+    DisplayLock lock;
+    s_brightness = (brightness * 255) / 100;
+#if OLED_ON_TFT
+    setBacklight(brightness);
+#else
+    s_u8g2.setContrast(s_brightness);
+#endif
 }
 
 void oled_display_next_screen() {
     s_currentScreen = (s_currentScreen + 1) % OLED_SCREEN_COUNT;
+    s_lastCycle = millis();
     s_needsRedraw = true;
     Serial.printf("[OLED] Screen: %d\n", s_currentScreen);
+    renderNow();
+}
+
+void oled_display_prev_screen() {
+    s_currentScreen = (s_currentScreen + OLED_SCREEN_COUNT - 1) % OLED_SCREEN_COUNT;
+    s_lastCycle = millis();
+    s_needsRedraw = true;
+    Serial.printf("[OLED] Screen: %d\n", s_currentScreen);
+    renderNow();
+}
+
+void oled_display_show_level(const char *title, uint8_t percent) {
+    showToast(title, NULL, percent / 100.0f);
+    renderNow();
+}
+
+bool oled_display_toggle_auto_cycle() {
+    s_autoCycle = !s_autoCycle;
+    s_lastCycle = millis();
+    Preferences prefs;
+    if (prefs.begin("sparkminer", false)) {
+        prefs.putBool("autocycle", s_autoCycle);
+        prefs.end();
+    }
+    char text[16];
+    if (s_autoCycle) snprintf(text, sizeof(text), "ON  EVERY %dS", AUTO_CYCLE_MS / 1000);
+    else             snprintf(text, sizeof(text), "OFF");
+    showToast("AUTO", text, -1);
+    Serial.printf("[OLED] Auto cycle %s\n", s_autoCycle ? "on" : "off");
+    renderNow();
+    return s_autoCycle;
 }
 
 void oled_display_show_ap_config(const char *ssid, const char *password, const char *ip) {
+    DisplayLock lock;
     s_u8g2.clearBuffer();
     s_blink = !s_blink;
     header("SETUP", true, false);
@@ -566,6 +816,7 @@ void oled_display_show_ap_config(const char *ssid, const char *password, const c
 }
 
 void oled_display_show_boot() {
+    DisplayLock lock;
     s_u8g2.clearBuffer();
 
     // Double border, like a cartridge label
@@ -586,6 +837,8 @@ void oled_display_show_boot() {
 }
 
 void oled_display_show_reset_countdown(int seconds) {
+    DisplayLock lock;
+    s_modal = true;
     s_u8g2.clearBuffer();
     s_blink = !s_blink;
     header("RESET", true, false);
@@ -600,6 +853,8 @@ void oled_display_show_reset_countdown(int seconds) {
 }
 
 void oled_display_show_reset_complete() {
+    DisplayLock lock;
+    s_modal = true;
     s_u8g2.clearBuffer();
     header("RESET", false, false);
 
@@ -610,41 +865,42 @@ void oled_display_show_reset_complete() {
 }
 
 void oled_display_redraw() {
+    s_modal = false;
     s_needsRedraw = true;
+    renderNow();
 }
 
 uint8_t oled_display_flip_rotation() {
-    s_rotation = (s_rotation == 0) ? 2 : 0;
-
-    if (s_rotation == 2) {
-        s_u8g2.setDisplayRotation(U8G2_R2);
-    } else {
-        s_u8g2.setDisplayRotation(U8G2_R0);
-    }
-
-    s_needsRedraw = true;
+    oled_display_set_rotation(s_rotation == 0 ? 2 : 0);
     return s_rotation;
 }
 
 void oled_display_set_rotation(uint8_t rotation) {
-    // OLED only supports 0 and 2 (180 degree flip)
-    s_rotation = (rotation >= 2) ? 2 : 0;
-
-    if (s_rotation == 2) {
-        s_u8g2.setDisplayRotation(U8G2_R2);
-    } else {
-        s_u8g2.setDisplayRotation(U8G2_R0);
+    // Only 0 and 2 (180 degree flip): both are landscape
+    {
+        DisplayLock lock;
+        s_rotation = (rotation >= 2) ? 2 : 0;
+        panelRotation(s_rotation);
+        s_needsRedraw = true;
     }
-
-    s_needsRedraw = true;
+    renderNow();
 }
 
 void oled_display_set_inverted(bool inverted) {
-    s_inverted = inverted;
-    // invertColors=true is the dark theme (the CYD panel is inverted), which on
-    // an OLED is the normal mode. SSD1306: 0xA6 normal, 0xA7 inverted.
-    s_u8g2.sendF("c", inverted ? 0xA6 : 0xA7);
-    s_needsRedraw = true;
+    {
+        DisplayLock lock;
+        s_inverted = inverted;
+#if OLED_ON_TFT
+        s_tft.fillScreen(colorDark());
+        blitCanvas();   // keep what is on screen (boot screen before any data)
+#else
+        // invertColors=true is the dark theme (the CYD panel is inverted), which on
+        // an OLED is the normal mode. SSD1306: 0xA6 normal, 0xA7 inverted.
+        s_u8g2.sendF("c", inverted ? 0xA6 : 0xA7);
+#endif
+        s_needsRedraw = true;
+    }
+    renderNow();
 }
 
 uint16_t oled_display_get_width() {
@@ -774,16 +1030,45 @@ void display_show_reset_complete() {
     oled_display_show_reset_complete();
 }
 
-// Screen timeout: OLEDs have no backlight, so power the panel down instead
-// (also saves the pixels from burn-in)
+void display_prev_screen() {
+    oled_display_prev_screen();
+}
+
+void display_show_level(const char *title, uint8_t percent) {
+    oled_display_show_level(title, percent);
+}
+
+bool display_toggle_auto_cycle() {
+    return oled_display_toggle_auto_cycle();
+}
+
+// Screen timeout. OLED: no backlight, so power the panel down instead (also
+// saves the pixels from burn-in). TFT: backlight off, panel asleep.
 void display_set_backlight_off() {
+    DisplayLock lock;
     s_screenOff = true;
+#if OLED_ON_TFT
+    setBacklight(0);
+    s_tft.writecommand(ST7789_SLPIN);
+#else
     s_u8g2.setPowerSave(1);
+#endif
 }
 
 void display_set_backlight_on() {
-    s_screenOff = false;
-    s_u8g2.setPowerSave(0);
+    {
+        DisplayLock lock;
+        if (!s_screenOff) return;
+        s_screenOff = false;
+#if OLED_ON_TFT
+        s_tft.writecommand(ST7789_SLPOUT);
+        delay(5);
+        setBacklight(s_brightness * 100 / 255);
+#else
+        s_u8g2.setPowerSave(0);
+#endif
+    }
+    renderNow();
 }
 
 bool display_is_backlight_off() { return s_screenOff; }

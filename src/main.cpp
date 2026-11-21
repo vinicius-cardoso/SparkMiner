@@ -139,6 +139,57 @@ void onButtonLongPressStart() {
 }
 #endif
 
+// Second button (T-Display): browse back, brightness, auto cycle, screen off.
+// GPIO35 is input-only and has an external pull-up, so no internal pull-up.
+#if defined(BUTTON2_PIN) && USE_OLED_DISPLAY
+OneButton button2(BUTTON2_PIN, true, false);
+
+// Any press on a dark screen only wakes it
+static bool wakeScreen() {
+    monitor_reset_activity();
+    if (display_is_backlight_off()) {
+        display_set_backlight_on();
+        return true;
+    }
+    return false;
+}
+
+// Single click: previous screen
+void onButton2Click() {
+    if (wakeScreen()) return;
+    display_prev_screen();
+}
+
+// Double click: step brightness down 100 -> 60 -> 30 -> 10 -> 100 (saved)
+void onButton2DoubleClick() {
+    if (wakeScreen()) return;
+    static const uint8_t kLevels[] = {100, 60, 30, 10};
+    miner_config_t *config = nvs_config_get();
+    uint8_t next = kLevels[0];
+    for (uint8_t level : kLevels) {
+        if (level < config->brightness) { next = level; break; }
+    }
+    config->brightness = next;
+    display_set_brightness(next);
+    display_show_level("LIGHT", next);
+    nvs_config_save(config);
+    Serial.printf("[BUTTON2] Brightness %u%%\n", next);
+}
+
+// Triple click: toggle auto cycling through the screens (saved)
+void onButton2MultiClick() {
+    if (wakeScreen()) return;
+    if (button2.getNumberClicks() == 3) display_toggle_auto_cycle();
+}
+
+// Long press: screen off now (any button wakes it)
+void onButton2LongPressStart() {
+    if (wakeScreen()) return;
+    Serial.println("[BUTTON2] Screen off");
+    display_set_backlight_off();
+}
+#endif
+
 #if defined(BUTTON_PIN) && (USE_DISPLAY || USE_OLED_DISPLAY || USE_EINK_DISPLAY)
 /**
  * Dedicated button handling task (with display)
@@ -148,6 +199,9 @@ void button_task(void *param) {
     Serial.println("[BUTTON] Task started on core 0");
     for (;;) {
         button.tick();
+        #if defined(BUTTON2_PIN) && USE_OLED_DISPLAY
+            button2.tick();
+        #endif
         vTaskDelay(pdMS_TO_TICKS(10));  // 10ms polling = responsive buttons
     }
 }
@@ -397,6 +451,16 @@ void setup() {
         button.attachMultiClick(onButtonMultiClick);          // Triple-click for inversion
         button.attachLongPressStart(onButtonLongPressStart);  // Factory reset handler
         Serial.println("[INIT] Button handlers registered (click/double/triple/long-press)");
+    #endif
+    #if defined(BUTTON2_PIN) && USE_OLED_DISPLAY
+        button2.setClickMs(400);
+        button2.setPressMs(1000);
+        button2.setDebounceMs(50);
+        button2.attachClick(onButton2Click);
+        button2.attachDoubleClick(onButton2DoubleClick);
+        button2.attachMultiClick(onButton2MultiClick);
+        button2.attachLongPressStart(onButton2LongPressStart);
+        Serial.println("[INIT] Button 2 handlers registered (prev/light/auto/off)");
     #endif
 
     // Initialize WiFiManager and connect

@@ -215,6 +215,13 @@ void display_set_backlight_off();
 void display_set_backlight_on();
 bool display_is_backlight_off();
 
+#if USE_OLED_DISPLAY
+// Second-button actions (display_oled.cpp)
+void display_prev_screen();
+void display_show_level(const char *title, uint8_t percent);
+bool display_toggle_auto_cycle();
+#endif
+
 #endif // USE_DISPLAY
 
 #endif // DISPLAY_H

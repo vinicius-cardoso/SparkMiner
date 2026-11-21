@@ -2,6 +2,11 @@
 
 **High-performance Bitcoin solo miner for ESP32, ESP32-S3 & ESP32-C3**
 
+> **About this fork:** a modified version of [SneezeGUI/SparkMiner](https://github.com/SneezeGUI/SparkMiner), released under the same GPL v3 license. Changes in this fork:
+> - Retro UI for 128x64 SSD1306 OLEDs (Press Start 2P, SNES-style header, keycaps, block bars) with MINER, LOTTO, POOL and CHAIN screens
+> - Tenstar T-Display (LILYGO T-Display V1 clone) support (`tenstar-t-display`): the same OLED UI drawn at 2x on the ST7789, plus actions on the second button
+> - Classic ESP32 fixes: DPORT errata workaround in the pipelined SHA loop and a glitch-filtered `millis()`
+
 <img src="images/1767589853452.jpg" alt="SparkMiner Display" width="575">
 
 SparkMiner is optimized firmware for ESP32-based boards with displays, delivering **~1+ MH/s** (pool-reported) using hardware-accelerated SHA-256 and pipelined assembly mining. Supports both ESP32 "Cheap Yellow Display" (CYD) boards and ESP32-S3 variants.
@@ -152,6 +157,7 @@ Find your board below and download the matching firmware from [Releases](https:/
 | **Wemos Lolin32 + OLED** | `wemos-lolin32-oled_firmware.bin` | 128x64 SSD1306 I2C (SDA=5, SCL=4, RST=16, addr=0x3C) |
 | **NodeMCU ESP32** | `esp32-headless_firmware.bin` | Use headless firmware |
 | **ESP32 DevKit + SSD1306 OLED** | `esp32-devkit-oled_firmware.bin` | 128x64 I2C OLED (SDA=GPIO21, SCL=GPIO22, addr=0x3C) |
+| **Tenstar T-Display** (T-Display V1 clone) | `tenstar-t-display_firmware.bin` | 1.14" ST7789, same retro UI as the OLED builds at 2x; second button on GPIO35 |
 
 ### File Types
 
@@ -182,6 +188,7 @@ Find your board below and download the matching firmware from [Releases](https:/
 | ESP32 Headless | ✅ Full | GPIO LED status indicator |
 | LILYGO T-Display S3 | ❌ None | Not yet supported |
 | LILYGO T-Display V1 | ❌ None | Not yet supported |
+| Tenstar T-Display (V1 clone) | ✅ Full | Retro OLED UI at 2x. BOOT: click next screen, double flip, triple theme, hold factory reset. GPIO35: click previous screen, double brightness, triple auto cycle, hold screen off |
 | ESP32-S2 boards | ❌ None | Single-core not supported |
 | M5Stack boards | ❌ None | Not configured |
 
